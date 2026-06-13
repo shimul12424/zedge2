@@ -359,7 +359,8 @@ jobs:
               return;
             }
             try {
-              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(message)}`;
+              const formattedMessage = `Hey! Shimul\n${message.replace(/,\s*Sir\b/g, ", Shimul").replace(/\bSir\b/g, "Shimul")}`;
+              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(formattedMessage)}`;
               const res = await fetch(url);
               if (!res.ok) {
                 console.log(`Facebook API response failed: HTTP ${res.status}`);
@@ -709,10 +710,12 @@ jobs:
                   if (!(await btn.isVisible())) continue;
                   const text = (await btn.innerText().catch(() => "")).trim().toLowerCase();
                   
-                  // Only click very obvious accept buttons
-                  if (text === "ok" || text === "accept" || text === "continue") {
+                  // Expand matching list to include Zedge's Close button and other standard consent options
+                  const allowedTexts = ["ok", "accept", "continue", "close", "agree", "accept all", "agree & close", "consent"];
+                  if (allowedTexts.includes(text)) {
                     await btn.click().catch(() => {});
                     clickedAny = true;
+                    console.log(`Clicked consent popup button: "${text}"`);
                     await page.waitForTimeout(500);
                     break;
                   }
@@ -1517,13 +1520,15 @@ jobs:
                   await page.waitForLoadState("networkidle");
 
                   // Click Profiles tab
-                  await safeClick(
+                  await safeClickWithPopupRecovery(
+                    page,
                     page.locator('a:has-text("Profiles")').first(),
                     "Profiles"
                   );
 
                   // Click the correct rotated profile
-                  await safeClick(
+                  await safeClickWithPopupRecovery(
+                    page,
                     page.locator('[data-hook="profile-list"] > div').nth(currentProfileIndex),
                     `Profile Index ${currentProfileIndex}`
                   );
