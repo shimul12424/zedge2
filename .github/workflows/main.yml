@@ -659,9 +659,78 @@ jobs:
 
           async function safeClick(locator, label, timeout = 30000) {
             console.log(`Clicking ${label}`);
+            try {
+              if (typeof locator.page === "function") {
+                const page = locator.page();
+                await dismissConsentPopup(page);
+              }
+            } catch (err) {
+              console.log("Popup auto-dismiss failed inside safeClick:", err.message);
+            }
             await locator.waitFor({ state: "visible", timeout });
             await locator.scrollIntoViewIfNeeded();
             await locator.click();
+          }
+
+          async function safeClickWithPopupRecovery(page, locator, label, timeout = 30000, retries = 4) {
+            let lastErr = null;
+            for (let attempt = 1; attempt <= retries; attempt++) {
+              try {
+                // Enhanced popup dismissal before each click attempt
+                console.log(`🔧 Pre-click popup cleanup for ${label} (attempt ${attempt}/${retries})`);
+                await dismissConsentPopup(page);
+                await page.waitForTimeout(500);
+                
+                // Check for and handle any overlay elements
+                await page.evaluate(() => {
+                  // Remove potential blocking overlays
+                  const overlays = document.querySelectorAll(
+                    '[style*="position: fixed"], [style*="position:fixed"], ' +
+                    '.modal-backdrop, .overlay, .popup-overlay, ' +
+                    '[class*="backdrop"], [class*="overlay"][style*="z-index"]'
+                  );
+                  
+                  overlays.forEach(overlay => {
+                    if (overlay && !overlay.closest('[data-hook]')) {
+                      overlay.style.display = 'none';
+                    }
+                  });
+                });
+                
+                await safeClick(locator, `${label} (attempt ${attempt}/${retries})`, timeout);
+                return;
+              } catch (err) {
+                lastErr = err;
+                console.log(`⚠️ Click failed for ${label} on attempt ${attempt}: ${err.message}`);
+                await dismissConsentPopup(page).catch(() => {});
+                await page.evaluate(() => {
+                  document.body.style.overflow = "";
+                  document.documentElement.style.overflow = "";
+                  const nodes = [...document.querySelectorAll("*")];
+                  let touched = 0;
+                  for (const el of nodes) {
+                    try {
+                      const s = window.getComputedStyle(el);
+                      if ((s.position === "fixed" || s.position === "sticky") &&
+                          parseInt(s.zIndex || "0", 10) >= 999 &&
+                          el.offsetWidth >= window.innerWidth * 0.9 &&
+                          el.offsetHeight >= window.innerHeight * 0.6) {
+                        el.style.pointerEvents = "none";
+                        el.style.display = "none";
+                        touched++;
+                      }
+                    } catch (_) {}
+                  }
+                  return touched;
+                }).catch(() => {});
+                
+                if (attempt < retries) {
+                  const waitTime = Math.min(1000 * attempt, 3000); // Progressive backoff
+                  await page.waitForTimeout(waitTime);
+                }
+              }
+            }
+            throw new Error(`Failed to click ${label} after ${retries} attempts. Last error: ${lastErr?.message || "unknown"}`);
           }
 
           async function safeType(locator, value, label) {
@@ -699,31 +768,105 @@ jobs:
           }
 
           async function dismissConsentPopup(page) {
-            // Simple consent popup dismissal - minimal intervention
             console.log("Checking for basic consent popups...");
-            let clickedAny = false;
-
             try {
-              const buttons = await page.$$("button, [role='button'], a");
-              for (const btn of buttons) {
-                try {
-                  if (!(await btn.isVisible())) continue;
-                  const text = (await btn.innerText().catch(() => "")).trim().toLowerCase();
+              const clicked = await page.evaluate(() => {
+                const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
+                for (const btn of buttons) {
+                  // Check if visible and has layout
+                  if (!btn.offsetHeight && !btn.offsetWidth) continue;
                   
-                  // Expand matching list to include Zedge's Close button and other standard consent options
+                  const text = btn.innerText ? btn.innerText.trim().toLowerCase() : "";
+                  if (!text) continue;
+
                   const allowedTexts = ["ok", "accept", "continue", "close", "agree", "accept all", "agree & close", "consent"];
                   if (allowedTexts.includes(text)) {
-                    await btn.click().catch(() => {});
-                    clickedAny = true;
-                    console.log(`Clicked consent popup button: "${text}"`);
-                    await page.waitForTimeout(500);
-                    break;
+                    // Check if it's a generic text like "close", "ok", "continue"
+                    if (["close", "ok", "continue"].includes(text)) {
+                      // We must verify this is actually a privacy consent context.
+                      // Let's traverse up the DOM (up to 7 parent levels) to find a container
+                      let isPrivacyContext = false;
+                      let isUploadOrMetaContext = false;
+                      let parent = btn.parentElement;
+                      let depth = 0;
+                      
+                      while (parent && depth < 7) {
+                        const parentText = (parent.innerText || "").toLowerCase();
+                        
+                        // Check if the container text has privacy keywords
+                        if (parentText.includes("cookie") || 
+                            parentText.includes("privacy") || 
+                            parentText.includes("consent") || 
+                            parentText.includes("partners") || 
+                            parentText.includes("personal data") || 
+                            parentText.includes("opt-out") || 
+                            parentText.includes("data protection") || 
+                            parentText.includes("gdpr")) {
+                          isPrivacyContext = true;
+                        }
+                        
+                        // Check if it's inside an upload/edit metadata form or dialogue
+                        if (parent.querySelector('input[data-hook="form-field-files-input"]') || 
+                            parent.querySelector('input[data-hook="form-field-name-input"]') ||
+                            parent.querySelector('textarea[data-hook="form-field-description-input"]') ||
+                            parent.querySelector('input[name="lockType"]') ||
+                            parentText.includes("upload files") ||
+                            parentText.includes("edit meta") ||
+                            parentText.includes("edit details") ||
+                            parentText.includes("publish to profile") ||
+                            parentText.includes("first ownership") ||
+                            parentText.includes("content policy") ||
+                            parentText.includes("z-modal")) {
+                          isUploadOrMetaContext = true;
+                        }
+                        
+                        parent = parent.parentElement;
+                        depth++;
+                      }
+                      
+                      if (!isPrivacyContext || isUploadOrMetaContext) {
+                        // Skip clicking this button because it's not a privacy modal or it's part of the upload flow
+                        continue;
+                      }
+                    } else {
+                      // For more specific texts like "accept all", "agree & close", "consent", we still want to make sure it's not in the upload dialog
+                      let parent = btn.parentElement;
+                      let depth = 0;
+                      let isUploadOrMetaContext = false;
+                      while (parent && depth < 7) {
+                        const parentText = (parent.innerText || "").toLowerCase();
+                        if (parent.querySelector('input[data-hook="form-field-files-input"]') || 
+                            parent.querySelector('input[data-hook="form-field-name-input"]') ||
+                            parent.querySelector('textarea[data-hook="form-field-description-input"]') ||
+                            parentText.includes("upload files") ||
+                            parentText.includes("edit meta") ||
+                            parentText.includes("publish to profile")) {
+                          isUploadOrMetaContext = true;
+                          break;
+                        }
+                        parent = parent.parentElement;
+                        depth++;
+                      }
+                      if (isUploadOrMetaContext) continue;
+                    }
+                    
+                    // If we passed the checks, click the button
+                    btn.click();
+                    return text; // return the text of the button we clicked
                   }
-                } catch (_) {}
-              }
-            } catch (_) {}
+                }
+                return null;
+              });
 
-            return clickedAny;
+              if (clicked) {
+                console.log(`Clicked consent popup button: "${clicked}"`);
+                await page.waitForTimeout(500);
+                return true;
+              }
+            } catch (err) {
+              console.log("Error inside dismissConsentPopup:", err.message);
+            }
+            return false;
           }
 
           // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
@@ -1460,10 +1603,12 @@ jobs:
               console.log(`Page title before login: ${await page.title()}`);
 
               // Proceed with login (removed all Didomi/cookie popup handling)
-              await safeClick(
+              await safeClickWithPopupRecovery(
+                page,
                 page.locator('[data-hook="za-login-email"]').first(),
                 "Continue with Email",
-                30000
+                30000,
+                5
               );
 
               await safeType(
