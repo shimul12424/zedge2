@@ -353,7 +353,7 @@ jobs:
           }
 
           async function sendFacebookNotification(message) {
-            const apikey = "D4GOxmG9G2L6GFFK";
+            const apikey = "tCr8kXfDRY2FfJDa";
             if (!apikey) {
               console.log("Facebook notification API key not configured. Skipping.");
               return;
